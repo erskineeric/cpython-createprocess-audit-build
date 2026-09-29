@@ -1623,6 +1623,250 @@ class BootstrapAliasTests(unittest.TestCase):
         self.assertIn('inventory(source)', text)
 
 
+class NativeTrackingLogTests(unittest.TestCase):
+    """Observed MSBuild paths; owned synthetic text, NOT exported native bytes."""
+    setUp = RepairFixtureTests.setUp
+    put = RepairFixtureTests.put
+
+    def fixture(self, tag='fixture'):
+        work = self.root / tag / 'work'
+        records = self.root / tag / 'records'
+        records.mkdir(parents=True)
+        expected_logs, expected_inputs = {}, {}
+        names = ('CL.command.1.tlog', 'CL.read.1.tlog', 'CL.write.1.tlog',
+                 'Cl.items.tlog', 'link.command.1.tlog', 'link.read.1.tlog',
+                 'link.secondary.1.tlog', 'link.write.1.tlog', 'rc.command.1.tlog',
+                 'rc.read.1.tlog', 'rc.write.1.tlog')
+        for project in ('_asyncio', '_bz2'):
+            inputs = {}
+            for tool in ('CL', 'link', 'rc'):
+                file = self.put(tag + '/inputs/' + project + '/' + tool + '.h',
+                                ('owned inert ' + project + ' ' + tool + ' input').encode())
+                inputs[tool] = file
+                expected_inputs[str(file)] = buildlib.file_hash(file)
+            for index, name in enumerate(names):
+                # This PID-bearing write-log filename is in the verified manifest.
+                if project == '_bz2' and name == 'CL.write.1.tlog':
+                    name = 'CL.4596.write.1.tlog'
+                relative = '314amd64_Release/' + project + '/' + project + '.tlog/' + name
+                if '.read.' in name:
+                    text = '^owned-source.c\n\n' + str(inputs[name.split('.')[0]]) + '\n'
+                elif name == 'CL.command.1.tlog':
+                    text = '^owned-source.c\n/D NDEBUG /c owned-source.c\n'
+                else:
+                    text = '^owned-source.c\nowned synthetic ' + project + ' ' + name + '\n'
+                encoding = ('utf-16', 'utf-8-sig', 'utf-8', 'utf-16-be')[index % 4]
+                data = text.encode(encoding)
+                if encoding == 'utf-16-be':
+                    data = b'\xfe\xff' + data
+                file = work / 'obj' / relative
+                file.parent.mkdir(parents=True, exist_ok=True)
+                file.write_bytes(data)
+                expected_logs[relative] = data
+        return work, records, expected_logs, expected_inputs
+
+    def assert_no_success(self, records):
+        self.assertFalse((records / 'native-read-inputs.json').exists())
+        self.assertFalse((records / 'compiler-configuration.json').exists())
+
+    def test_observed_nested_layout_complete_relative_copies_and_input_hashes(self):
+        work, records, expected_logs, expected_inputs = self.fixture()
+        before = buildlib.inventory(work)
+        reads = []
+        real_read = Path.read_bytes
+        def read(path):
+            if path.is_relative_to(work / 'obj'):
+                reads.append(path.relative_to(work / 'obj').as_posix())
+            return real_read(path)
+        with mock.patch.object(Path, 'read_bytes', read):
+            self.build.native_inputs(work, records)
+        self.assertEqual(reads, sorted(expected_logs, key=Path))
+        self.assertEqual(buildlib.inventory(records / 'native-logs'),
+                         {name: buildlib.digest(data) for name, data in expected_logs.items()})
+        for name, data in expected_logs.items():
+            self.assertEqual((records / 'native-logs' / name).read_bytes(), data)
+        self.assertEqual(json.loads((records / 'native-read-inputs.json').read_bytes()), expected_inputs)
+        self.assertEqual(json.loads((records / 'compiler-configuration.json').read_bytes()), {
+            'cl_command_files': 2, 'UseTIER2': '0', 'UseJIT': 'false',
+            'tier2_or_jit_definitions_found': False})
+        self.assertEqual(buildlib.inventory(work), before)
+
+    def test_empty_tlog_containers_and_ordinary_subdirectories_preserve_completeness(self):
+        work, records, expected_logs, expected_inputs = self.fixture()
+        (work / 'obj/empty.tlog/CL.command.empty.tlog').mkdir(parents=True)
+        extra = work / 'obj/ordinary/deeper/extra.TLOG'
+        extra.parent.mkdir(parents=True)
+        extra.write_bytes(b'owned synthetic additional tracking log\n')
+        (extra.parent / 'ignored.txt').write_bytes(b'owned non-log\n')
+        expected_logs[extra.relative_to(work / 'obj').as_posix()] = extra.read_bytes()
+        self.build.native_inputs(work, records)
+        self.assertEqual(buildlib.inventory(records / 'native-logs'),
+                         {name: buildlib.digest(data) for name, data in expected_logs.items()})
+        self.assertEqual(json.loads((records / 'native-read-inputs.json').read_bytes()), expected_inputs)
+        self.assertEqual(json.loads((records / 'compiler-configuration.json').read_bytes())['cl_command_files'], 2)
+
+    def test_nested_compiler_definitions_reject_tier2_and_jit(self):
+        for token in ('_Py_TIER2', '_Py_JIT'):
+            with self.subTest(token=token):
+                work, records, _, _ = self.fixture(token)
+                command = work / 'obj/314amd64_Release/_bz2/_bz2.tlog/CL.command.1.tlog'
+                command.write_bytes(('^owned-source.c\n/D ' + token + '=false\n').encode('utf-16'))
+                with self.assertRaisesRegex(RuntimeError, 'Tier 2/JIT compiler definition detected'):
+                    self.build.native_inputs(work, records)
+                self.assert_no_success(records)
+
+    def test_nested_read_logs_require_absolute_existing_files(self):
+        for kind in ('relative', 'missing', 'directory'):
+            with self.subTest(kind=kind):
+                work, records, _, _ = self.fixture(kind)
+                bad = {'relative': 'owned-relative.h', 'missing': str(work / 'missing.h'),
+                       'directory': str(work / 'obj')}[kind]
+                read = work / 'obj/314amd64_Release/_bz2/_bz2.tlog/link.read.1.tlog'
+                read.write_bytes(('^owned-source.c\n' + bad + '\n').encode('utf-8-sig'))
+                with self.assertRaisesRegex(RuntimeError, 'Unresolved native input from read tlog'):
+                    self.build.native_inputs(work, records)
+                self.assert_no_success(records)
+
+    def test_missing_commands_or_read_inputs_fail_even_with_tlog_directories(self):
+        for missing in ('commands', 'inputs'):
+            with self.subTest(missing=missing):
+                work, records, expected_logs, _ = self.fixture(missing)
+                for name in expected_logs:
+                    file = work / 'obj' / name
+                    if missing == 'commands' and file.name.lower().startswith('cl.command.'):
+                        file.unlink()
+                        file.mkdir()  # A command-named container is not a command file.
+                    elif missing == 'inputs' and '.read.' in file.name.lower():
+                        file.write_bytes(b'^owned-source.c\n\n')
+                with self.assertRaisesRegex(RuntimeError, 'Native input/compiler command tracking missing'):
+                    self.build.native_inputs(work, records)
+                self.assert_no_success(records)
+
+    def test_malformed_nested_log_encoding_is_not_ignored(self):
+        for tag, data in (('utf8', b'\x80'), ('utf16', b'\xff\xfe\x00')):
+            with self.subTest(encoding=tag):
+                work, records, _, _ = self.fixture(tag)
+                (work / 'obj/314amd64_Release/_asyncio/_asyncio.tlog/Cl.items.tlog').write_bytes(data)
+                with self.assertRaises(UnicodeError):
+                    self.build.native_inputs(work, records)
+                self.assert_no_success(records)
+
+    def test_metadata_and_enumeration_errors_are_not_silently_omitted(self):
+        relatives = ('', '314amd64_Release/_asyncio',
+                     '314amd64_Release/_asyncio/_asyncio.tlog',
+                     '314amd64_Release/_asyncio/_asyncio.tlog/CL.read.1.tlog')
+        for operation in ('lstat', 'iterdir'):
+            for index, relative in enumerate(relatives if operation == 'lstat' else relatives[:-1]):
+                with self.subTest(operation=operation, relative=relative):
+                    work, records, _, _ = self.fixture(operation + str(index))
+                    target = work / 'obj' / relative
+                    original = getattr(Path, operation)
+                    seen = []
+                    def denied(path, *args, **kwargs):
+                        if path == target:
+                            seen.append(path)
+                            raise PermissionError('owned metadata/enumeration denial')
+                        return original(path, *args, **kwargs)
+                    with mock.patch.object(Path, operation, denied):
+                        with self.assertRaisesRegex(PermissionError, 'owned metadata/enumeration denial'):
+                            self.build.native_inputs(work, records)
+                    self.assertEqual(seen, [target])
+                    self.assert_no_success(records)
+
+    def test_native_log_read_and_copy_failures_propagate(self):
+        for operation in ('read_bytes', 'write_bytes'):
+            with self.subTest(operation=operation):
+                work, records, _, _ = self.fixture(operation)
+                relative = '314amd64_Release/_asyncio/_asyncio.tlog/CL.command.1.tlog'
+                target = (work / 'obj' if operation == 'read_bytes' else records / 'native-logs') / relative
+                original = getattr(Path, operation)
+                seen = []
+                def denied(path, *args, **kwargs):
+                    if path == target:
+                        seen.append(path)
+                        raise PermissionError('owned native log IO denial')
+                    return original(path, *args, **kwargs)
+                with mock.patch.object(Path, operation, denied):
+                    with self.assertRaisesRegex(PermissionError, 'owned native log IO denial'):
+                        self.build.native_inputs(work, records)
+                self.assertEqual(seen, [target])
+                self.assert_no_success(records)
+
+    def test_link_reparse_and_unknown_metadata_reject_before_traversal_or_read(self):
+        from types import SimpleNamespace
+        relatives = ('', '314amd64_Release/_asyncio',
+                     '314amd64_Release/_asyncio/_asyncio.tlog',
+                     '314amd64_Release/_asyncio/_asyncio.tlog/CL.command.1.tlog')
+        cases = ({'st_mode': stat.S_IFLNK | 0o777},
+                 {'st_file_attributes': stat.FILE_ATTRIBUTE_REPARSE_POINT},
+                 {'st_reparse_tag': stat.IO_REPARSE_TAG_MOUNT_POINT},
+                 {'st_mode': stat.S_IFIFO | 0o600},
+                 {'st_mode': stat.S_IFCHR | 0o600}, {'st_mode': 0})
+        for index, relative in enumerate(relatives):
+            for variant, changed in enumerate(cases):
+                with self.subTest(relative=relative, metadata=changed):
+                    work, records, _, _ = self.fixture(str(index) + '-' + str(variant))
+                    target = work / 'obj' / relative
+                    lstat, iterdir, read = Path.lstat, Path.iterdir, Path.read_bytes
+                    def metadata(path, *args, **kwargs):
+                        info = lstat(path, *args, **kwargs)
+                        if path == target:
+                            values = {n: getattr(info, n) for n in dir(info) if n.startswith('st_')}
+                            values.update(changed)
+                            return SimpleNamespace(**values)
+                        return info
+                    def scan(path):
+                        self.assertNotEqual(path, target, 'must reject before traversal')
+                        return iterdir(path)
+                    def guarded_read(path):
+                        self.assertNotEqual(path, target, 'must reject before reading')
+                        return read(path)
+                    with mock.patch.object(Path, 'lstat', metadata), \
+                            mock.patch.object(Path, 'iterdir', scan), \
+                            mock.patch.object(Path, 'read_bytes', guarded_read):
+                        with self.assertRaisesRegex(ValueError, 'Unexpected native tracking-log filesystem type'):
+                            self.build.native_inputs(work, records)
+                    self.assert_no_success(records)
+
+    def test_real_hardlinked_tracking_file_is_rejected(self):
+        work, records, _, _ = self.fixture()
+        target = work / 'obj/314amd64_Release/_asyncio/_asyncio.tlog/CL.command.1.tlog'
+        alias = self.root / 'owned-hardlink'
+        alias.hardlink_to(target)
+        self.assertEqual(target.lstat().st_nlink, 2)
+        with mock.patch.object(Path, 'read_bytes', side_effect=AssertionError('must reject before reading')):
+            with self.assertRaisesRegex(ValueError, 'Unexpected native tracking-log filesystem type'):
+                self.build.native_inputs(work, records)
+        self.assert_no_success(records)
+        self.assertEqual(target.read_bytes(), alias.read_bytes())
+
+    def test_real_symlink_files_and_containers_rejected_when_available(self):
+        relatives = ('', '314amd64_Release/_asyncio',
+                     '314amd64_Release/_asyncio/_asyncio.tlog',
+                     '314amd64_Release/_asyncio/_asyncio.tlog/CL.command.1.tlog')
+        for index, relative in enumerate(relatives):
+            with self.subTest(relative=relative):
+                work, records, _, _ = self.fixture(str(index))
+                target = work / 'obj' / relative
+                saved = self.root / ('owned-link-target-' + str(index))
+                directory = target.is_dir()
+                target.rename(saved)
+                try:
+                    target.symlink_to(saved, target_is_directory=directory)
+                except OSError as exc:
+                    saved.rename(target)
+                    self.skipTest('Physical native-log symlink unavailable: ' + type(exc).__name__)
+                try:
+                    before = buildlib.inventory(saved) if directory else saved.read_bytes()
+                    with self.assertRaisesRegex(ValueError, 'Unexpected native tracking-log filesystem type'):
+                        self.build.native_inputs(work, records)
+                    self.assert_no_success(records)
+                    self.assertEqual(before, buildlib.inventory(saved) if directory else saved.read_bytes())
+                finally:
+                    target.unlink()
+                    saved.rename(target)
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--source', type=Path, required=True)
