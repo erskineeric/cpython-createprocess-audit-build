@@ -302,12 +302,33 @@ def capture_build_state(work, records):
         write_json(records / name, inventory(work / directory))
 
 
+def _native_tracking_logs(path):
+    """Walk ordinary containers without glob's silent filesystem-error omissions."""
+    info = path.lstat()  # Never classify a link by following its target.
+    if (stat.S_ISLNK(info.st_mode)
+            or getattr(info, 'st_file_attributes', 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+            or getattr(info, 'st_reparse_tag', 0)):
+        raise ValueError('Unexpected native tracking-log filesystem type')
+    if stat.S_ISDIR(info.st_mode):
+        # MSBuild uses project.tlog directories containing CL/link/rc *.tlog files.
+        # iterdir/lstat failures propagate, including for non-.tlog containers.
+        for child in path.iterdir():
+            yield from _native_tracking_logs(child)
+    elif stat.S_ISREG(info.st_mode):
+        if path.suffix.lower() == '.tlog':
+            if info.st_nlink != 1:
+                raise ValueError('Unexpected native tracking-log filesystem type')
+            yield path
+    else:
+        raise ValueError('Unexpected native tracking-log filesystem type')
+
+
 def native_inputs(work, records):
     inputs = {}
     command_count = 0
     logs = records / 'native-logs'
     logs.mkdir()
-    for path in sorted((work / 'obj').rglob('*.tlog')):
+    for path in sorted(_native_tracking_logs(work / 'obj')):
         data = path.read_bytes()
         text = data.decode('utf-16') if data.startswith((b'\xff\xfe', b'\xfe\xff')) else data.decode('utf-8-sig')
         target = logs / path.relative_to(work / 'obj')
