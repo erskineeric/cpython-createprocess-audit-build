@@ -1248,6 +1248,381 @@ class InventoryDiagnosticTests(unittest.TestCase):
         self.assertEqual(str(caught.exception), "Inventory root must be a real directory: '.'")
 
 
+class BootstrapAliasTests(unittest.TestCase):
+    """Owned inert python.exe; metadata/readlink seams are NOT hosted proof."""
+    setUp = RepairFixtureTests.setUp
+    put = RepairFixtureTests.put
+    PAYLOAD = b'owned ordinary bootstrap fixture; never execute this file'
+
+    def fixture(self):
+        executable = self.put('bootstrap/python.exe', self.PAYLOAD)
+        self.put('bootstrap/Lib/os.py', b'inert stdlib fixture')
+        alias = self.put('bootstrap/python3.exe', b'emulated link object; not target bytes')
+        records = self.root / 'records'
+        records.mkdir()
+        return executable.parent, executable, alias, records
+
+    def links(self, targets, *, attributes=None):
+        from contextlib import ExitStack
+        from types import SimpleNamespace
+        stack = ExitStack()
+        original_lstat = Path.lstat
+        original_readlink = os.readlink
+        def lstat(path, *args, **kwargs):
+            value = original_lstat(path, *args, **kwargs)
+            values = {n: getattr(value, n) for n in dir(value) if n.startswith('st_')}
+            if path in targets:
+                values.update(st_mode=stat.S_IFLNK | 0o777, st_file_attributes=0x400,
+                              st_reparse_tag=stat.IO_REPARSE_TAG_SYMLINK)
+            values.update((attributes or {}).get(path, {}))
+            return SimpleNamespace(**values)
+        def readlink(path, *args, **kwargs):
+            if Path(path) in targets:
+                return targets[Path(path)]
+            return original_readlink(path, *args, **kwargs)
+        stack.enter_context(mock.patch.object(Path, 'lstat', lstat))
+        stack.enter_context(mock.patch.object(os, 'readlink', readlink))
+        return stack
+
+    def snapshot(self, tree, executable, records, **kwargs):
+        with mock.patch.object(self.build.sys, 'executable', str(executable)):
+            return self.build.snapshot_roots({'bootstrap': tree}, records, **kwargs)
+
+    def test_checked_alias_snapshot_and_export(self):
+        tree, executable, alias, records = self.fixture()
+        with self.links({alias: 'python.exe'}), \
+                mock.patch.object(self.build.sys, 'executable', str(executable)), \
+                mock.patch.object(self.build, 'run', side_effect=AssertionError('no fixture execution')):
+            maps = self.build.snapshot_roots({'bootstrap': tree}, records)
+            files = maps['bootstrap']['files']
+            proof = files['python3.exe']
+            self.assertEqual(proof['classification'], 'selected-bootstrap-file-symlink')
+            self.assertEqual(proof['raw_target'], 'python.exe')
+            self.assertEqual(proof['resolved_relative_target'], 'python.exe')
+            self.assertEqual(proof['sha256'], buildlib.digest(self.PAYLOAD))
+            self.assertEqual(proof['sha256'], files['python.exe'])
+            self.assertEqual(proof['target_identity']['ino'], executable.lstat().st_ino)
+            self.assertEqual(proof['target_identity']['dev'], executable.lstat().st_dev)
+            self.assertEqual(proof['link_identity']['ino'], alias.lstat().st_ino)
+            self.assertEqual(proof['selected_executable'], str(executable))
+            self.assertEqual(set(files), {'python.exe', 'python3.exe', 'Lib/os.py'})
+            initial_bytes = (records / 'input-bootstrap.json').read_bytes()
+            self.assertEqual(json.loads(initial_bytes), maps['bootstrap'])
+            self.assertEqual(self.build.snapshot_roots({'bootstrap': tree}, records, expected=maps), maps)
+            self.build.verify_roots(maps)
+            artifact = self.root / 'artifact'
+            artifact.mkdir()
+            buildlib.export_recipe(ROOT, artifact / 'recipe', buildlib.recipe_inventory(ROOT))
+            self.build.recorded_pipeline(records, lambda: artifact)
+            self.assertEqual((artifact / 'records/input-bootstrap.json').read_bytes(), initial_bytes)
+            manifest = json.loads((artifact / 'manifest.json').read_bytes())
+            self.assertEqual(manifest['files']['records/input-bootstrap.json'], buildlib.digest(initial_bytes))
+            self.assertFalse((artifact / 'python3.exe').exists())
+
+    def test_default_inventory_still_rejects_exact_alias_before_read(self):
+        tree, executable, alias, records = self.fixture()
+        with self.links({alias: 'python.exe'}), \
+                mock.patch.object(os, 'readlink') as readlink, \
+                mock.patch.object(buildlib, 'file_hash') as hashed:
+            for operation in (lambda: buildlib.inventory(tree),
+                              lambda: buildlib.verify_inventory(tree, {}),
+                              lambda: buildlib.recipe_inventory(tree),
+                              lambda: self.build.snapshot_roots({'dependency': tree}, records)):
+                with self.assertRaisesRegex(ValueError, 'Unexpected filesystem link'):
+                    operation()
+            readlink.assert_not_called()
+            hashed.assert_not_called()
+        self.assertEqual(list(records.iterdir()), [])
+
+    def test_other_names_nested_and_excluded_links_reject_before_target_read(self):
+        for name in ('python3.11.exe', 'python3.14.exe', 'pythonw.exe',
+                     'unlisted.exe', 'Lib/python3.exe', 'Lib/site-packages'):
+            with self.subTest(name=name):
+                base = self.root / name.replace('/', '-')
+                executable = base / 'python.exe'
+                executable.parent.mkdir()
+                executable.write_bytes(self.PAYLOAD)
+                link = base / name
+                link.parent.mkdir(parents=True, exist_ok=True)
+                link.write_bytes(b'inert link fixture')
+                with self.links({link: 'python.exe'}), \
+                        mock.patch.object(os, 'readlink') as readlink, \
+                        mock.patch.object(buildlib, 'file_hash', wraps=buildlib.file_hash) as hashed:
+                    with self.assertRaisesRegex(ValueError, 'Unexpected filesystem link'):
+                        buildlib.inventory(base, exclude_dirs=('site-packages',),
+                                           bootstrap_executable=executable)
+                    readlink.assert_not_called()
+                    self.assertNotIn(link, [Path(c.args[0]) for c in hashed.call_args_list])
+
+    def test_wrong_external_dangling_loop_and_chained_raw_targets(self):
+        tree, executable, alias, records = self.fixture()
+        outside = self.put('outside/python.exe', b'not selected')
+        other = self.put('bootstrap/other.exe', b'ordinary wrong target')
+        for raw in ('other.exe', str(outside), '../outside/python.exe', 'absent.exe',
+                    'python3.exe', 'chain.exe', 'Lib/../python.exe', './python.exe'):
+            with self.subTest(raw=raw), self.links({alias: raw}), \
+                    mock.patch.object(buildlib, 'file_hash') as hashed:
+                with self.assertRaisesRegex(ValueError, 'Bootstrap alias rejected') as caught:
+                    buildlib.inventory(tree, bootstrap_executable=executable)
+                self.assertIn(ascii(raw), str(caught.exception))
+                hashed.assert_not_called()
+        self.assertEqual(outside.read_bytes(), b'not selected')
+        self.assertEqual(other.read_bytes(), b'ordinary wrong target')
+
+    def test_target_must_be_ordinary_present_and_unlinked(self):
+        tree, executable, alias, records = self.fixture()
+        for kind in ('linked', 'junction', 'directory', 'hardlinked', 'absent'):
+            with self.subTest(kind=kind):
+                links = {alias: 'python.exe'}
+                attributes = {}
+                if kind == 'linked':
+                    links[executable] = 'other.exe'
+                elif kind == 'junction':
+                    attributes[executable] = {'st_file_attributes': 0x400,
+                                              'st_reparse_tag': stat.IO_REPARSE_TAG_MOUNT_POINT}
+                elif kind == 'directory':
+                    attributes[executable] = {'st_mode': stat.S_IFDIR | 0o755}
+                elif kind == 'hardlinked':
+                    attributes[executable] = {'st_nlink': 2}
+                else:
+                    executable.unlink()
+                try:
+                    with self.links(links, attributes=attributes), \
+                            mock.patch.object(buildlib, 'file_hash') as hashed:
+                        with self.assertRaises((ValueError, OSError)):
+                            buildlib.inventory(tree, bootstrap_executable=executable)
+                        hashed.assert_not_called()
+                finally:
+                    if kind == 'absent':
+                        executable.write_bytes(self.PAYLOAD)
+
+    def test_candidate_must_be_file_symlink_not_directory_or_unknown_reparse(self):
+        tree, executable, alias, records = self.fixture()
+        for metadata in ({'st_file_attributes': 0x410},
+                         {'st_reparse_tag': stat.IO_REPARSE_TAG_MOUNT_POINT},
+                         {'st_reparse_tag': 0}, {'st_mode': stat.S_IFREG | 0o644}):
+            with self.subTest(metadata=metadata), \
+                    self.links({alias: 'python.exe'}, attributes={alias: metadata}), \
+                    mock.patch.object(os, 'readlink') as readlink, \
+                    mock.patch.object(buildlib, 'file_hash') as hashed:
+                with self.assertRaises(ValueError):
+                    buildlib.inventory(tree, bootstrap_executable=executable)
+                readlink.assert_not_called()
+                hashed.assert_not_called()
+
+    def test_root_ancestor_and_child_reparse_never_traversed(self):
+        tree, executable, alias, records = self.fixture()
+        child = tree / 'Lib'
+        for path in (tree.parent, tree, child):
+            with self.subTest(path=path.name), \
+                    self.links({alias: 'python.exe'}, attributes={path: {'st_file_attributes': 0x400}}), \
+                    mock.patch.object(os, 'scandir', wraps=os.scandir) as scan, \
+                    mock.patch.object(os, 'readlink') as readlink, \
+                    mock.patch.object(buildlib, 'file_hash') as hashed:
+                with self.assertRaises(ValueError):
+                    buildlib.inventory(tree, bootstrap_executable=executable)
+                self.assertNotIn(child, [Path(c.args[0]) for c in scan.call_args_list])
+                readlink.assert_not_called()
+                hashed.assert_not_called()
+
+    def test_selected_executor_must_be_exact_target_not_equal_bytes_elsewhere(self):
+        tree, executable, alias, records = self.fixture()
+        other = self.put('other/python.exe', self.PAYLOAD)
+        for selected in (other, alias, tree / 'absent.exe'):
+            with self.subTest(selected=selected.name), self.links({alias: 'python.exe'}), \
+                    mock.patch.object(buildlib, 'file_hash') as hashed:
+                with self.assertRaisesRegex(ValueError, 'Bootstrap alias rejected'):
+                    buildlib.inventory(tree, bootstrap_executable=selected)
+                hashed.assert_not_called()
+
+    def test_absolute_target_preserves_actual_raw_spelling(self):
+        tree, executable, alias, records = self.fixture()
+        values = [str(executable)]
+        if os.name == 'nt':
+            values.append('\\\\?\\' + str(executable))
+        for raw in values:
+            with self.subTest(raw=raw), self.links({alias: raw}):
+                files = buildlib.inventory(tree, bootstrap_executable=executable)
+                self.assertEqual(files['python3.exe']['raw_target'], raw)
+                self.assertEqual(files['python3.exe']['resolved_relative_target'], 'python.exe')
+
+    def test_missing_alias_and_no_alias_initial_state_are_compared(self):
+        tree, executable, alias, records = self.fixture()
+        with self.links({alias: 'python.exe'}):
+            maps = self.snapshot(tree, executable, records)
+        alias.unlink()
+        with mock.patch.object(self.build.sys, 'executable', str(executable)):
+            with self.assertRaisesRegex(RuntimeError, 'Toolchain input tree changed'):
+                self.build.verify_roots(maps)
+            with self.assertRaisesRegex(RuntimeError, 'Toolchain input tree changed'):
+                self.build.snapshot_roots({'bootstrap': tree}, records, expected=maps)
+            self.assertEqual(json.loads((records / 'input-bootstrap.json').read_bytes()), maps['bootstrap'])
+            absent = self.build.snapshot_roots({'bootstrap': tree}, records)
+            self.assertNotIn('python3.exe', absent['bootstrap']['files'])
+            alias.write_bytes(b'emulated new alias')
+            with self.links({alias: 'python.exe'}), self.assertRaises(RuntimeError):
+                self.build.verify_roots(absent)
+
+    def test_revalidation_detects_raw_identity_content_and_type_drift(self):
+        tree, executable, alias, records = self.fixture()
+        with self.links({alias: 'python.exe'}):
+            maps = self.snapshot(tree, executable, records)
+        saved = (records / 'input-bootstrap.json').read_bytes()
+        for kind in ('raw', 'link-identity', 'target-identity', 'content', 'ordinary-alias'):
+            with self.subTest(kind=kind):
+                links = {alias: str(executable) if kind == 'raw' else 'python.exe'}
+                attributes = {}
+                if kind == 'link-identity':
+                    attributes[alias] = {'st_ino': alias.lstat().st_ino + 1}
+                elif kind == 'target-identity':
+                    attributes[executable] = {'st_ino': executable.lstat().st_ino + 1}
+                elif kind == 'content':
+                    executable.write_bytes(b'changed inert target')
+                elif kind == 'ordinary-alias':
+                    links = {}
+                with self.links(links, attributes=attributes), \
+                        mock.patch.object(self.build.sys, 'executable', str(executable)):
+                    with self.assertRaises(RuntimeError):
+                        self.build.verify_roots(maps)
+                    with self.assertRaises(RuntimeError):
+                        self.build.snapshot_roots({'bootstrap': tree}, records, expected=maps)
+                self.assertEqual((records / 'input-bootstrap.json').read_bytes(), saved)
+                if kind == 'content':
+                    executable.write_bytes(self.PAYLOAD)
+
+    def test_target_read_never_opens_alias_and_detects_during_hash_drift(self):
+        tree, executable, alias, records = self.fixture()
+        real_hash = buildlib.file_hash
+        reads = []
+        targets = {alias: 'python.exe'}
+        def hashed(path):
+            reads.append(Path(path))
+            self.assertNotEqual(Path(path), alias)
+            value = real_hash(path)
+            if Path(path) == executable:
+                targets[alias] = 'wrong.exe'
+            return value
+        with self.links(targets), mock.patch.object(buildlib, 'file_hash', side_effect=hashed):
+            with self.assertRaises(ValueError):
+                buildlib.inventory(tree, bootstrap_executable=executable)
+        self.assertIn(executable, reads)
+        self.assertNotIn(alias, reads)
+
+    def test_failure_records_preserve_meaningful_rejected_target(self):
+        tree, executable, alias, records = self.fixture()
+        with self.links({alias: 'wrong.exe'}):
+            with self.assertRaisesRegex(ValueError, "raw_target='wrong.exe'"):
+                self.build.recorded_pipeline(records, lambda: self.snapshot(tree, executable, records))
+        self.assertEqual(json.loads((records / 'status.json').read_bytes())['state'], 'failed')
+        self.assertFalse((records / 'input-bootstrap.json').exists())
+        self.assertTrue((records / 'manifest.json').exists())
+
+    def test_real_owned_physical_alias_when_available(self):
+        tree, executable, alias, records = self.fixture()
+        alias.unlink()
+        try:
+            alias.symlink_to('python.exe')
+        except OSError as exc:
+            self.skipTest('Physical owned alias unavailable: ' + type(exc).__name__)
+        with mock.patch.object(self.build.sys, 'executable', str(executable)):
+            maps = self.build.snapshot_roots({'bootstrap': tree}, records)
+            self.build.verify_roots(maps)
+            self.assertEqual(maps['bootstrap']['files']['python3.exe']['sha256'], buildlib.digest(self.PAYLOAD))
+
+    def test_ambiguous_absolute_spellings_and_nonordinary_link_identity(self):
+        tree, executable, alias, records = self.fixture()
+        for raw in (str(tree) + os.sep + '.' + os.sep + 'python.exe',
+                    str(tree) + os.sep * 2 + 'python.exe'):
+            with self.subTest(raw=raw), self.links({alias: raw}), \
+                    mock.patch.object(buildlib, 'file_hash') as hashed:
+                with self.assertRaises(ValueError):
+                    buildlib.inventory(tree, bootstrap_executable=executable)
+                hashed.assert_not_called()
+        for metadata in ({'st_nlink': 2}, {'st_ino': 0}):
+            with self.subTest(metadata=metadata), \
+                    self.links({alias: 'python.exe'}, attributes={alias: metadata}), \
+                    mock.patch.object(os, 'readlink') as readlink, \
+                    mock.patch.object(buildlib, 'file_hash') as hashed:
+                with self.assertRaises(ValueError):
+                    buildlib.inventory(tree, bootstrap_executable=executable)
+                readlink.assert_not_called()
+                hashed.assert_not_called()
+
+    def test_directory_candidate_and_both_ends_of_loop_are_rejected(self):
+        tree, executable, alias, records = self.fixture()
+        alias.unlink()
+        alias.mkdir()
+        with self.links({alias: 'python.exe'}), \
+                mock.patch.object(os, 'readlink') as readlink, \
+                mock.patch.object(buildlib, 'file_hash') as hashed:
+            with self.assertRaisesRegex(ValueError, 'Bootstrap alias rejected: python3.exe; directory entry'):
+                buildlib.inventory(tree, bootstrap_executable=executable)
+            readlink.assert_not_called()
+            hashed.assert_not_called()
+        alias.rmdir()
+        alias.write_bytes(b'emulated loop alias')
+        with self.links({alias: 'python.exe', executable: 'python3.exe'}), \
+                mock.patch.object(os, 'readlink') as readlink, \
+                mock.patch.object(buildlib, 'file_hash') as hashed:
+            with self.assertRaisesRegex(ValueError, 'Unexpected filesystem link'):
+                buildlib.inventory(tree, bootstrap_executable=executable)
+            readlink.assert_not_called()
+            hashed.assert_not_called()
+
+    def test_snapshot_preserves_ordinary_exclusion_and_rejects_unlisted_link(self):
+        tree, executable, alias, records = self.fixture()
+        self.put('bootstrap/Lib/site-packages/not-consumed.txt', b'ordinary excluded fixture')
+        with self.links({alias: 'python.exe'}):
+            maps = self.snapshot(tree, executable, records)
+        self.assertEqual(set(maps['bootstrap']['files']), {'python.exe', 'python3.exe', 'Lib/os.py'})
+        saved = (records / 'input-bootstrap.json').read_bytes()
+        unknown = self.put('bootstrap/unlisted.exe', b'emulated unlisted symlink')
+        with self.links({alias: 'python.exe', unknown: 'python.exe'}), \
+                mock.patch.object(self.build.sys, 'executable', str(executable)), \
+                mock.patch.object(os, 'readlink') as readlink, \
+                mock.patch.object(buildlib, 'file_hash') as hashed:
+            with self.assertRaises(ValueError):
+                self.build.verify_roots(maps)
+            readlink.assert_not_called()
+            hashed.assert_not_called()
+        self.assertEqual((records / 'input-bootstrap.json').read_bytes(), saved)
+
+    def test_target_changes_during_hash_and_selected_executor_drift(self):
+        tree, executable, alias, records = self.fixture()
+        with self.links({alias: 'python.exe'}):
+            maps = self.snapshot(tree, executable, records)
+        other = self.put('elsewhere/python.exe', self.PAYLOAD)
+        with self.links({alias: 'python.exe'}), mock.patch.object(self.build.sys, 'executable', str(other)):
+            with self.assertRaises(ValueError):
+                self.build.verify_roots(maps)
+        original_hash = buildlib.file_hash
+        def changed(path):
+            value = original_hash(path)
+            if Path(path) == executable:
+                executable.write_bytes(b'changed while reading inventory')
+            return value
+        with self.links({alias: 'python.exe'}), mock.patch.object(buildlib, 'file_hash', side_effect=changed):
+            with self.assertRaisesRegex(ValueError, 'changed during inventory'):
+                buildlib.inventory(tree, bootstrap_executable=executable)
+
+    def test_initial_binding_survives_toolchain_snapshot_and_final_verification_wiring(self):
+        tree = ast.parse((ROOT / 'scripts/build.py').read_text(encoding='utf-8'))
+        functions = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+        body = functions['perform_build']
+        text = ast.unparse(body)
+        self.assertIn("bootstrap_inputs = snapshot_roots({'bootstrap': Path(sys.base_prefix)}, records)", text)
+        self.assertLess(text.index('bootstrap_inputs ='), text.index('download('))
+        self.assertIn('toolchain(work, records, bootstrap_inputs)', text)
+        self.assertIn('snapshot_roots(roots, records, expected=bootstrap_inputs)',
+                      ast.unparse(functions['toolchain']))
+        self.assertLess(text.index('verify_roots(bootstrap_inputs)'), text.index("ROOT / 'scripts/verify_source.py'"))
+        self.assertLess(text.index('verify_roots(input_maps)'), text.index('run(command,'))
+        self.assertGreater(text.rindex('verify_roots(bootstrap_inputs)'), text.index('run(command,'))
+        self.assertLess(text.rindex('verify_roots(bootstrap_inputs)'), text.index('make_package('))
+        self.assertGreater(text.rindex('verify_roots(input_maps)'), text.index("records / 'audit-gate.json'"))
+        self.assertIn('inventory(source)', text)
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--source', type=Path, required=True)
