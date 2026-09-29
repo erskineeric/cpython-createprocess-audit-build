@@ -175,28 +175,113 @@ def file_hash(path):
         return hashlib.file_digest(stream, 'sha256').hexdigest()
 
 
-def inventory(root, *, exclude_dirs=()):
+def _reparse(info):
+    return bool(getattr(info, 'st_file_attributes', 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def _bootstrap_directories(root):
+    # Lexical, top-down checks: never resolve through an ancestor link/junction.
+    if not root.is_absolute() or '..' in root.parts:
+        raise ValueError('Bootstrap root must be an absolute ordinary directory')
+    for path in [*reversed(root.parents), root]:
+        info = path.lstat()
+        if path.is_symlink() or _reparse(info) or not stat.S_ISDIR(info.st_mode):
+            raise ValueError('Bootstrap directory/ancestor is not ordinary')
+
+
+def _identity(info):
+    return {name: getattr(info, 'st_' + name) for name in
+            ('dev', 'ino', 'mode', 'nlink', 'size', 'mtime_ns', 'ctime_ns')}
+
+
+def _bootstrap_alias(root, selected):
+    """Validate ONE direct file symlink without opening it or resolving chains."""
+    path, target = root / 'python3.exe', root / 'python.exe'
+    info = path.lstat()
+    attributes = getattr(info, 'st_file_attributes', 0)
+    tag = getattr(info, 'st_reparse_tag', 0)
+    classification = f'mode={info.st_mode}; attributes={attributes}; reparse_tag={tag}'
+    def reject(reason, raw=None):
+        detail = '' if raw is None else '; raw_target=' + ascii(raw[:512])
+        if raw is not None and len(raw) > 512:
+            detail += ' [truncated]'
+        raise ValueError('Bootstrap alias rejected: python3.exe; ' + reason + '; '
+                         + classification + detail)
+    if (not stat.S_ISLNK(info.st_mode) or info.st_nlink != 1 or not info.st_ino
+            or attributes & stat.FILE_ATTRIBUTE_DIRECTORY
+            or (os.name == 'nt' and (not _reparse(info) or tag != stat.IO_REPARSE_TAG_SYMLINK))):
+        reject('not an ordinary file symlink')
+    raw = os.readlink(path)  # Preserve the actual raw string, not Path.readlink normalization.
+    spelling = raw
+    # Windows readlink may return the extended-length local-drive spelling.
+    if os.name == 'nt' and spelling.startswith('\\\\?\\'):
+        spelling = spelling[4:]
+        if not re.match(r'^[A-Za-z]:\\', spelling):
+            reject('unexpected extended target', raw)
+    candidate = Path(spelling)
+    if (spelling != 'python.exe' and
+            (not candidate.is_absolute() or candidate != target
+             or os.path.normcase(spelling) != os.path.normcase(str(target)))):
+        reject('target is not direct same-root python.exe', raw)
+    if Path(selected) != target or not Path(selected).is_absolute():
+        reject('target is not the selected bootstrap interpreter', raw)
+    try:
+        target_info = target.lstat()
+    except OSError:
+        reject('target is missing or unreadable', raw)
+    if (not stat.S_ISREG(target_info.st_mode) or _reparse(target_info)
+            or target_info.st_nlink != 1 or not target_info.st_ino):
+        reject('target is not an ordinary single-link file with identity', raw)
+    return {'classification': 'selected-bootstrap-file-symlink', 'raw_target': raw,
+            'resolved_relative_target': 'python.exe', 'selected_executable': str(selected),
+            'link_identity': _identity(info), 'target_identity': _identity(target_info),
+            'link_file_attributes': attributes, 'link_reparse_tag': tag}
+
+
+def inventory(root, *, exclude_dirs=(), bootstrap_executable=None):
+    """Strict by default; only bootstrap snapshots opt into the exact alias proof."""
     root = Path(root)
+    bootstrap = bootstrap_executable is not None
+    if bootstrap:
+        _bootstrap_directories(root)
     if not root.is_dir() or root.is_symlink():
         raise ValueError("Inventory root must be a real directory: '.'")
     result = {}
+    alias = None
     def failed_walk(error):
         raise error
     for directory, dirs, files in os.walk(root, onerror=failed_walk):
+        candidate = False
         for name in dirs + files:
-            if (Path(directory) / name).is_symlink():
-                # Lexical path only: no resolution, target read, or change to rejection order.
-                relative = (Path(directory) / name).relative_to(root).as_posix()
+            path = Path(directory) / name
+            if path.is_symlink() or (bootstrap and _reparse(path.lstat())):
+                relative = path.relative_to(root).as_posix()
+                if bootstrap and relative == 'python3.exe':
+                    if name in dirs:
+                        raise ValueError('Bootstrap alias rejected: python3.exe; directory entry; target not read')
+                    candidate = True
+                    continue
+                # All other links: lexical diagnostic only, before target reads/descent.
                 detail = ascii(relative[:512])
                 if len(relative) > 512:
                     detail += ' [truncated]'
                 raise ValueError('Unexpected filesystem link: ' + detail)
+        if candidate:
+            alias = _bootstrap_alias(root, bootstrap_executable)
         dirs[:] = sorted(n for n in dirs if n not in exclude_dirs)
         for name in sorted(files):
             path = Path(directory) / name
+            if alias is not None and path == root / 'python3.exe':
+                continue  # Represent explicitly below; NEVER open the alias.
             if not path.is_file():
                 raise ValueError('Unexpected non-file input')
             result[path.relative_to(root).as_posix()] = file_hash(path)
+    if alias is not None:
+        _bootstrap_directories(root)
+        if (_bootstrap_alias(root, bootstrap_executable) != alias
+                or 'python.exe' not in result):
+            raise ValueError('Bootstrap alias or target changed during inventory')
+        result['python3.exe'] = dict(alias, sha256=result['python.exe'])
     return dict(sorted(result.items()))
 
 
