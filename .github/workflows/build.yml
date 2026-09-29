@@ -1,0 +1,82 @@
+{
+  "name": "CPython 3.14.7 audit correction - diagnostic build",
+  "on": {
+    "workflow_dispatch": {}
+  },
+  "permissions": {
+    "contents": "read"
+  },
+  "concurrency": {
+    "group": "cpython-audit-${{ github.run_id }}-${{ github.run_attempt }}",
+    "cancel-in-progress": false
+  },
+  "jobs": {
+    "build": {
+      "runs-on": "windows-2022",
+      "timeout-minutes": 90,
+      "steps": [
+        {
+          "name": "Initialize records-only output",
+          "id": "records",
+          "shell": "pwsh",
+          "run": "$ErrorActionPreference = 'Stop'\n$records = Join-Path $env:RUNNER_TEMP ('cpython-audit-records-' + $env:GITHUB_RUN_ID + '-' + $env:GITHUB_RUN_ATTEMPT)\nNew-Item -ItemType Directory -Path $records -ErrorAction Stop | Out-Null\n\"records=$records\" >> $env:GITHUB_OUTPUT\n$hostExe = (Get-Process -Id $PID).Path\n@{state='initialized'; runtime_exported=$false; powershell_version=$PSVersionTable.PSVersion.ToString(); powershell_executable_sha256=(Get-FileHash -Algorithm SHA256 -LiteralPath $hostExe).Hash.ToLowerInvariant()} | ConvertTo-Json | Set-Content -Encoding utf8NoBOM -LiteralPath (Join-Path $records 'workflow-status.json')"
+        },
+        {
+          "name": "Checkout build recipe",
+          "uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+          "with": {
+            "persist-credentials": false,
+            "fetch-depth": 1,
+            "clean": false
+          }
+        },
+        {
+          "name": "Verify source, build, and gate app-local interpreter",
+          "id": "package",
+          "shell": "pwsh",
+          "run": "try {\n$ErrorActionPreference = 'Stop'\nif ($env:ImageOS -ne 'win22' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted') { throw 'Standard windows-2022 runner required' }\n$base = Join-Path $env:RUNNER_TOOL_CACHE 'Python'\n$candidates = @(Get-ChildItem -LiteralPath $base -Directory | Where-Object { $_.Name -match '^3\\.11\\.\\d+$' } | Sort-Object { [version]$_.Name } -Descending)\nif ($candidates.Count -eq 0) { throw 'Preinstalled CPython 3.11 required; no install fallback' }\n$python = Join-Path $candidates[0].FullName 'x64\\python.exe'\nif (-not (Test-Path -LiteralPath $python -PathType Leaf)) { throw 'Missing preinstalled x64 bootstrap interpreter' }\n$work = Join-Path $env:RUNNER_TEMP ('cpython-audit-' + $env:GITHUB_RUN_ID + '-' + $env:GITHUB_RUN_ATTEMPT)\n& $python -I -S -B scripts/build.py --work $work --records $env:RECORDS_DIR\nif ($LASTEXITCODE -ne 0) { throw ('Build pipeline failed: ' + $LASTEXITCODE) }\n} catch {\n@{state='failed'; runtime_exported=$false; exception_type=$_.Exception.GetType().FullName} | ConvertTo-Json | Set-Content -Encoding utf8NoBOM -LiteralPath (Join-Path $env:RECORDS_DIR 'workflow-failure.json')\nthrow\n}",
+          "env": {
+            "RECORDS_DIR": "${{ steps.records.outputs.records }}"
+          }
+        },
+        {
+          "name": "Seal final workflow records",
+          "if": "${{ always() && steps.records.outputs.records != '' }}",
+          "shell": "pwsh",
+          "env": {
+            "RECORDS_DIR": "${{ steps.records.outputs.records }}",
+            "PRIOR_JOB_STATUS": "${{ job.status }}",
+            "PACKAGE_OUTCOME": "${{ steps.package.outcome }}"
+          },
+          "run": "$ErrorActionPreference = 'Stop'\n$root = $env:RECORDS_DIR\n@{prior_job_status=$env:PRIOR_JOB_STATUS; package_outcome=$env:PACKAGE_OUTCOME; meaning='workflow observation, not upload proof'} | ConvertTo-Json | Set-Content -Encoding utf8NoBOM -LiteralPath (Join-Path $root 'workflow-outcome.json')\n$files = [ordered]@{}\nGet-ChildItem -LiteralPath $root -File -Recurse -Force | Sort-Object FullName | ForEach-Object {\n  $rel = [IO.Path]::GetRelativePath($root, $_.FullName).Replace('\\','/')\n  if ($rel -ne 'workflow-manifest.json') { $files[$rel] = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant() }\n}\n@{schema=1; self_exclusion='workflow-manifest.json'; files=$files} | ConvertTo-Json -Depth 8 | Set-Content -Encoding utf8NoBOM -LiteralPath (Join-Path $root 'workflow-manifest.json')"
+        },
+        {
+          "name": "Preserve diagnostic records",
+          "if": "${{ always() && steps.records.outputs.records != '' }}",
+          "uses": "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+          "with": {
+            "name": "cpython-audit-records-${{ github.run_id }}-${{ github.run_attempt }}",
+            "path": "${{ steps.records.outputs.records }}",
+            "if-no-files-found": "error",
+            "retention-days": 3,
+            "compression-level": 6,
+            "include-hidden-files": false
+          }
+        },
+        {
+          "name": "Upload verified diagnostic package",
+          "uses": "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+          "with": {
+            "name": "cpython-3.14.7-audit-x64-${{ github.run_id }}-${{ github.run_attempt }}",
+            "path": "${{ steps.package.outputs.artifact }}",
+            "if-no-files-found": "error",
+            "retention-days": 3,
+            "compression-level": 6,
+            "include-hidden-files": true
+          },
+          "if": "${{ success() && steps.package.outcome == 'success' && steps.package.outputs.artifact != '' }}"
+        }
+      ]
+    }
+  }
+}
