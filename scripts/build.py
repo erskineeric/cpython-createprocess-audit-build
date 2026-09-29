@@ -71,22 +71,44 @@ def recorded_pipeline(records, operation):
         raise
 
 
-def snapshot_roots(roots, records):
+def _root_record(name, path):
+    excluded = ('site-packages',) if name == 'bootstrap' else ()
+    options = {'bootstrap_executable': sys.executable} if name == 'bootstrap' else {}
+    record = {'root': str(path), 'files': inventory(path, exclude_dirs=excluded, **options),
+              'excluded_directories': list(excluded)}
+    if name == 'bootstrap':
+        record['selected_executable'] = sys.executable
+    return record
+
+
+def snapshot_roots(roots, records, *, expected=None):
+    # A later toolchain snapshot must retain, not overwrite/rebaseline, initial proof.
+    expected = {} if expected is None else expected
+    if not expected.keys() <= roots.keys():
+        raise RuntimeError('Missing previously snapshotted root')
     maps = {}
     for name, path in roots.items():
-        excluded = ('site-packages',) if name == 'bootstrap' else ()
-        record = {'root': str(path), 'files': inventory(path, exclude_dirs=excluded),
-                  'excluded_directories': list(excluded)}
-        write_json(records / ('input-' + name + '.json'), record)
+        record = _root_record(name, path)
+        if name in expected:
+            if record != expected[name]:
+                raise RuntimeError('Toolchain input tree changed: ' + name)
+        else:
+            write_json(records / ('input-' + name + '.json'), record)
         maps[name] = record
     return maps
+
+
+def verify_roots(maps):
+    for name, record in maps.items():
+        if _root_record(name, record['root']) != record:
+            raise RuntimeError('Toolchain input tree changed: ' + name)
 
 
 def version_tuple(text):
     return tuple(int(x) for x in text.split('.'))
 
 
-def toolchain(work, records):
+def toolchain(work, records, bootstrap_inputs):
     installer = Path(os.environ['ProgramFiles(x86)']) / 'Microsoft Visual Studio/Installer/vswhere.exe'
     run([installer, '-products', '*', '-version', '[17.0,18.0)',
          '-requires', 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64',
@@ -134,7 +156,7 @@ def toolchain(work, records):
              'sdk-imports': sdk / 'DesignTime', 'crt': crt, 'ucrt': ucrt,
              'framework': Path(os.environ['WINDIR']) / 'Microsoft.NET/Framework64/v4.0.30319',
              'bootstrap': Path(sys.base_prefix), 'git': Path(git).resolve().parent.parent}
-    maps = snapshot_roots(roots, records)
+    maps = snapshot_roots(roots, records, expected=bootstrap_inputs)
     record['command_host'] = {os.environ['COMSPEC']: file_hash(os.environ['COMSPEC'])}
     record['input_manifests'] = {n: file_hash(records / ('input-' + n + '.json')) for n in maps}
     record['scope'] = ('Conservative selected available-input trees plus actual native read tlogs; '
@@ -319,12 +341,13 @@ def perform_build(work, records):
     env = child_environment()
     recipe = recipe_inventory(ROOT)
     write_json(records / 'recipe.json', recipe)
-    snapshot_roots({'bootstrap': Path(sys.base_prefix)}, records)
+    bootstrap_inputs = snapshot_roots({'bootstrap': Path(sys.base_prefix)}, records)
     pins = json.loads((ROOT / 'pins.json').read_bytes())
     source_pin = pins['source']
     archive = download(source_pin['url'], source_pin['sha256'], work / 'downloads/Python-3.14.7.tar.xz')
     download(source_pin['bundle_url'], source_pin['bundle_sha256'], archive.with_name(archive.name + '.sigstore'))
     shutil.copyfile(archive.with_name(archive.name + '.sigstore'), records / 'source.sigstore')
+    verify_roots(bootstrap_inputs)
     run([sys.executable, '-I', '-S', '-B', ROOT / 'scripts/verify_source.py', '--work', work, '--records', records],
         records / 'signature-log.txt', cwd=work)
     signature = json.loads((records / 'signature.json').read_bytes())
@@ -361,7 +384,7 @@ def perform_build(work, records):
                         omit_links=dependency.get('omit_links'))
         dependencies[dependency['name']] = archive_inventory(archive, dependency, externals / dependency['name'])
         write_json(records / 'dependencies.json', dependencies)
-    msbuild, vs, vc_version, sdk_version, crt, ucrt, git, input_maps = toolchain(work, records)
+    msbuild, vs, vc_version, sdk_version, crt, ucrt, git, input_maps = toolchain(work, records, bootstrap_inputs)
     output = work / 'out/amd64'
     properties = dict(pins['properties'])
     properties.update({'PySourcePath': str(source) + '\\', 'Py_OutDir': str(work / 'out'),
@@ -378,10 +401,12 @@ def perform_build(work, records):
     command.extend(f'/p:{key}={value}' for key, value in properties.items())
     write_json(records / 'build-command.json', command)
     assert_no_pth(output)
+    verify_roots(input_maps)
     try:
         run(command, records / 'build-log.txt', cwd=source / 'PCbuild', env=env)
     finally:
         capture_build_state(work, records)
+    verify_roots(bootstrap_inputs)
     # Do not conceal upstream regeneration: original source members must stay byte-identical.
     unexpected = {p: (digest((source / p).read_bytes()) if (source / p).is_file() else None)
                   for p, value in prepared.items()
@@ -405,9 +430,7 @@ def perform_build(work, records):
     gate = json.loads((records / 'audit-gate.json').read_bytes())
     if gate.get('passed') is not True or len(gate['cases']) != 8:
         raise RuntimeError('All eight ABI cases are required')
-    for name, record in input_maps.items():
-        if inventory(record['root'], exclude_dirs=record['excluded_directories']) != record['files']:
-            raise RuntimeError('Toolchain input tree changed: ' + name)
+    verify_roots(input_maps)
     capture_build_state(work, records)
     assert_no_pth(output)
     assert_no_pth(package)
