@@ -1178,6 +1178,76 @@ class StockPlaceholderTests(unittest.TestCase):
                 self.build.validate_package(package, crt, ucrt)
 
 
+class InventoryDiagnosticTests(unittest.TestCase):
+    """Inert link-diagnostic seams, not identification of any hosted link."""
+    setUp = RepairFixtureTests.setUp
+    put = RepairFixtureTests.put
+
+    def test_relative_link_rejected_before_hashing_traversal_and_exclusion(self):
+        for member, directory in [('Lib/observed-link', True),
+                                  ('Lib/site-packages', True),
+                                  ('Lib/observed-file', False)]:
+            with self.subTest(member=member):
+                tree = self.root / member.rsplit('/', 1)[1]
+                target = tree / member
+                payload = target / 'unread.txt' if directory else target
+                payload.parent.mkdir(parents=True)
+                payload.write_bytes(b'inert fixture; never read by inventory')
+                records = tree / 'records'
+                records.mkdir()
+                real_is_symlink = Path.is_symlink
+                def is_symlink(path):
+                    return path == target or real_is_symlink(path)
+                # Only the named ordinary fixture emulates a link. Keep real walking.
+                with mock.patch.object(Path, 'is_symlink', is_symlink), \
+                        mock.patch.object(buildlib.os, 'scandir', wraps=os.scandir) as scan, \
+                        mock.patch.object(buildlib.os, 'walk', wraps=os.walk) as walk, \
+                        mock.patch.object(Path, 'resolve', side_effect=AssertionError('resolve link')) as resolve, \
+                        mock.patch.object(Path, 'readlink', side_effect=AssertionError('read link target')) as readlink, \
+                        mock.patch.object(buildlib, 'file_hash', side_effect=AssertionError('hash link')) as hashed:
+                    with self.assertRaises(ValueError) as caught:
+                        self.build.snapshot_roots({'bootstrap': tree}, records)
+                    hashed.assert_not_called()
+                    resolve.assert_not_called()
+                    readlink.assert_not_called()
+                    walk.assert_called_once_with(tree, onerror=mock.ANY)
+                    self.assertEqual([Path(c.args[0]) for c in scan.call_args_list], [tree, tree / 'Lib'])
+                    self.assertEqual(str(caught.exception), 'Unexpected filesystem link: ' + repr(member))
+                self.assertEqual(list(records.iterdir()), [])
+
+    def test_link_diagnostic_escapes_and_bounds_only_lexical_relative_text(self):
+        # Lexical-only names allow control/long-name checks without creating invalid Windows files.
+        cases = [('link\n\x1b\u202e\u00e9', "'link\\n\\x1b\\u202e\\xe9'"),
+                 ('x' * 512 + 'omitted-suffix', "'" + 'x' * 512 + "' [truncated]")]
+        for member, expected in cases:
+            with self.subTest(case='long' if len(member) > 512 else 'escaped'):
+                target = self.root / member
+                with mock.patch.object(buildlib.os, 'walk', return_value=[(str(self.root), [], [member])]), \
+                        mock.patch.object(Path, 'is_symlink', lambda path: path == target), \
+                        mock.patch.object(Path, 'resolve', side_effect=AssertionError('resolve link')), \
+                        mock.patch.object(Path, 'readlink', side_effect=AssertionError('read link target')), \
+                        mock.patch.object(buildlib, 'file_hash', side_effect=AssertionError('hash link')) as hashed:
+                    with self.assertRaises(ValueError) as caught:
+                        buildlib.inventory(self.root, exclude_dirs=('site-packages',))
+                    hashed.assert_not_called()
+                message = str(caught.exception)
+                self.assertEqual(message, 'Unexpected filesystem link: ' + expected)
+                self.assertTrue(message.isascii())
+                self.assertLessEqual(len(message), 6200)
+                self.assertNotIn(str(self.root), message)
+                self.assertFalse(any(ord(c) < 32 or ord(c) == 127 for c in message))
+
+    def test_root_link_diagnostic_uses_dot_without_walking_or_hashing(self):
+        with mock.patch.object(Path, 'is_symlink', lambda path: path == self.root), \
+                mock.patch.object(buildlib.os, 'walk') as walk, \
+                mock.patch.object(buildlib, 'file_hash') as hashed:
+            with self.assertRaises(ValueError) as caught:
+                buildlib.inventory(self.root)
+            walk.assert_not_called()
+            hashed.assert_not_called()
+        self.assertEqual(str(caught.exception), "Inventory root must be a real directory: '.'")
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--source', type=Path, required=True)
