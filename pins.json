@@ -1,0 +1,115 @@
+{
+  "schema": 1,
+  "version": "3.14.7",
+  "source": {
+    "commit": "823f0323ee6ec1402088b73bce1a38473cac36dc",
+    "url": "https://www.python.org/ftp/python/3.14.7/Python-3.14.7.tar.xz",
+    "sha256": "3b48dac8fb59f62eaa67ac83c1eb12bda1b7a08406dd286e252c11a66be27f81",
+    "archive_root": "Python-3.14.7",
+    "bundle_url": "https://www.python.org/ftp/python/3.14.7/Python-3.14.7.tar.xz.sigstore",
+    "bundle_sha256": "6f41efc358b146b5548dbfc0414e9247441f8524fb6ef59f1c4ca946ffc70701",
+    "identity": "hugo@python.org",
+    "issuer": "https://github.com/login/oauth"
+  },
+  "dependencies": [
+    {
+      "name": "bzip2-1.0.8",
+      "repository": "python/cpython-source-deps",
+      "ref_at_review": "bzip2-1.0.8",
+      "commit": "05301997b2f9590f49c672cf3dfd3d3dfa7ad521",
+      "url": "https://codeload.github.com/python/cpython-source-deps/zip/05301997b2f9590f49c672cf3dfd3d3dfa7ad521",
+      "sha256": "44b15bede52b32f8673a2976621a847258b041243c003e30f4d9a05214785fe5",
+      "archive_root": "cpython-source-deps-05301997b2f9590f49c672cf3dfd3d3dfa7ad521"
+    },
+    {
+      "name": "xz-5.2.5",
+      "repository": "python/cpython-source-deps",
+      "ref_at_review": "xz-5.2.5",
+      "commit": "c6bc0c612605622aaef101a33a751f9de2ecc193",
+      "url": "https://codeload.github.com/python/cpython-source-deps/zip/c6bc0c612605622aaef101a33a751f9de2ecc193",
+      "sha256": "d99882a8f9fd48be0e605e27e3c077e5eaab370f6f52ebcc8ff754480ffdf0bc",
+      "archive_root": "cpython-source-deps-c6bc0c612605622aaef101a33a751f9de2ecc193"
+    },
+    {
+      "name": "zlib-ng-2.2.4",
+      "repository": "python/cpython-source-deps",
+      "ref_at_review": "zlib-ng-2.2.4",
+      "commit": "a502e047655c31db29601def76ad6539acacf43d",
+      "url": "https://codeload.github.com/python/cpython-source-deps/zip/a502e047655c31db29601def76ad6539acacf43d",
+      "sha256": "79f96b877b1539cf6fe2eeff2a03a04e1accbec07b06c48fcd0bebaec97f76aa",
+      "archive_root": "cpython-source-deps-a502e047655c31db29601def76ad6539acacf43d"
+    },
+    {
+      "name": "zstd-1.5.7",
+      "repository": "python/cpython-source-deps",
+      "ref_at_review": "zstd-1.5.7",
+      "commit": "eef946ae8cf1591c0e5cc5f43486210768647c2e",
+      "url": "https://codeload.github.com/python/cpython-source-deps/zip/eef946ae8cf1591c0e5cc5f43486210768647c2e",
+      "sha256": "6c5bb4e9571fe5c7c1c368caa37b08845e6119eccd413d533b4bfa6622e59559",
+      "archive_root": "cpython-source-deps-eef946ae8cf1591c0e5cc5f43486210768647c2e",
+      "omit_links": {
+        "tests/cli-tests/bin/unzstd": "242daddb4ed79680ac790d9f9c01ca43c8fc3a16f1af137f7cb090c086988782",
+        "tests/cli-tests/bin/zstdcat": "242daddb4ed79680ac790d9f9c01ca43c8fc3a16f1af137f7cb090c086988782"
+      }
+    },
+    {
+      "name": "mpdecimal-4.0.0",
+      "repository": "python/cpython-source-deps",
+      "ref_at_review": "mpdecimal-4.0.0",
+      "commit": "48316ec025c1ebe500854c332be0a12c640c7301",
+      "url": "https://codeload.github.com/python/cpython-source-deps/zip/48316ec025c1ebe500854c332be0a12c640c7301",
+      "sha256": "83d632cd1eb511eba6fdbd4a2f17ad16ca34c8e04558a4ca4e4d460d56471c22",
+      "archive_root": "cpython-source-deps-48316ec025c1ebe500854c332be0a12c640c7301"
+    },
+    {
+      "name": "sqlite-3.50.4.0",
+      "repository": "python/cpython-source-deps",
+      "ref_at_review": "sqlite-3.50.4.0",
+      "commit": "ef547e549b49a2822214ef7880c0ca212b32929e",
+      "url": "https://codeload.github.com/python/cpython-source-deps/zip/ef547e549b49a2822214ef7880c0ca212b32929e",
+      "sha256": "6dc74c466f2b8d558307fdb1c8b30e10973983c869e650a71aad4b34d929d05a",
+      "archive_root": "cpython-source-deps-ef547e549b49a2822214ef7880c0ca212b32929e"
+    },
+    {
+      "name": "openssl-bin-3.5.7",
+      "repository": "python/cpython-bin-deps",
+      "ref_at_review": "openssl-bin-3.5.7",
+      "commit": "3217be5a2a7e20dbc5f5b5160ef21a9c84de7138",
+      "url": "https://codeload.github.com/python/cpython-bin-deps/zip/3217be5a2a7e20dbc5f5b5160ef21a9c84de7138",
+      "sha256": "52ee098ab12223914fbf108edeaf31e09e7c9f9f2a575d121e192b131b6b8c00",
+      "archive_root": "cpython-bin-deps-3217be5a2a7e20dbc5f5b5160ef21a9c84de7138"
+    }
+  ],
+  "properties": {
+    "Configuration": "Release",
+    "Platform": "x64",
+    "PlatformToolset": "v143",
+    "IncludeExtensions": "true",
+    "IncludeExternals": "true",
+    "IncludeSSL": "true",
+    "IncludeCTypes": "false",
+    "IncludeTkinter": "false",
+    "IncludeTests": "false",
+    "IncludeTest": "false",
+    "DisableGil": "false",
+    "UseJIT": "false",
+    "UseTIER2": "0",
+    "KillPython": "false",
+    "PreferredToolArchitecture": "x64",
+    "ImportDirectoryBuildProps": "false",
+    "ImportDirectoryBuildTargets": "false",
+    "ForceImportBeforeCppTargets": "",
+    "ForceImportAfterCppTargets": "",
+    "ExternalProps": "",
+    "ForceRegen": "false",
+    "SigningCertificate": "",
+    "SigningCertificateSha1": "",
+    "SupportSigning": "false",
+    "BuildInParallel": "false",
+    "UseMultiToolTask": "false"
+  },
+  "actions": {
+    "actions/checkout": "11d5960a326750d5838078e36cf38b85af677262",
+    "actions/upload-artifact": "ea165f8d65b6e75b540449e92b4886f43607fa02"
+  }
+}
