@@ -178,14 +178,19 @@ def file_hash(path):
 def inventory(root, *, exclude_dirs=()):
     root = Path(root)
     if not root.is_dir() or root.is_symlink():
-        raise ValueError('Inventory root must be a real directory')
+        raise ValueError("Inventory root must be a real directory: '.'")
     result = {}
     def failed_walk(error):
         raise error
     for directory, dirs, files in os.walk(root, onerror=failed_walk):
         for name in dirs + files:
             if (Path(directory) / name).is_symlink():
-                raise ValueError('Unexpected filesystem link')
+                # Lexical path only: no resolution, target read, or change to rejection order.
+                relative = (Path(directory) / name).relative_to(root).as_posix()
+                detail = ascii(relative[:512])
+                if len(relative) > 512:
+                    detail += ' [truncated]'
+                raise ValueError('Unexpected filesystem link: ' + detail)
         dirs[:] = sorted(n for n in dirs if n not in exclude_dirs)
         for name in sorted(files):
             path = Path(directory) / name
